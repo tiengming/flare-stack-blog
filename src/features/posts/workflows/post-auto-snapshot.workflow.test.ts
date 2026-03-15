@@ -25,24 +25,46 @@ function toMsDurationLabel(duration: string): Duration {
 describe("PostAutoSnapshotWorkflow", () => {
   let adminContext: ReturnType<typeof createAdminTestContext>;
 
-  const step: WorkflowStep = {
-    do: (async (
-      _name: string,
-      configOrCallback: unknown,
-      maybeCallback?: unknown,
-    ) => {
-      const callback =
-        typeof configOrCallback === "function"
-          ? configOrCallback
-          : maybeCallback;
-      return await (callback as () => Promise<unknown>)();
-    }) as WorkflowStep["do"],
+  const stepDo: WorkflowStep["do"] = (async (
+    _name: string,
+    configOrCallback: unknown,
+    maybeCallback?: unknown,
+  ) => {
+    const callback =
+      typeof configOrCallback === "function" ? configOrCallback : maybeCallback;
+    return await (callback as () => Promise<unknown>)();
+  }) as WorkflowStep["do"];
+
+  const noopStep: WorkflowStep = {
+    do: stepDo,
     sleep: (async () => undefined) as WorkflowStep["sleep"],
     sleepUntil: (async () =>
       undefined) as unknown as WorkflowStep["sleepUntil"],
     waitForEvent: (async () =>
       undefined) as unknown as WorkflowStep["waitForEvent"],
   };
+
+  function createTimerStep(
+    onSleep?: (sleepCalls: number) => Promise<void> | void,
+  ): WorkflowStep {
+    let sleepCalls = 0;
+
+    return {
+      do: stepDo,
+      sleep: (async (_name: string, duration: number | string) => {
+        const durationMs =
+          typeof duration === "number"
+            ? duration
+            : ms(toMsDurationLabel(duration));
+
+        vi.advanceTimersByTime(durationMs);
+        sleepCalls += 1;
+        await onSleep?.(sleepCalls);
+      }) as WorkflowStep["sleep"],
+      sleepUntil: noopStep.sleepUntil,
+      waitForEvent: noopStep.waitForEvent,
+    };
+  }
 
   beforeEach(async () => {
     vi.restoreAllMocks();
@@ -134,6 +156,9 @@ describe("PostAutoSnapshotWorkflow", () => {
   });
 
   it("creates an auto revision after the quiet window", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T10:00:00.000Z"));
+
     const tag = unwrap(
       await TagService.createTag(adminContext, { name: "auto-workflow-tag" }),
     );
@@ -164,7 +189,7 @@ describe("PostAutoSnapshotWorkflow", () => {
       {
         payload: { postId: id, quietWindowSeconds: 5 },
       } as WorkflowEvent<{ postId: number; quietWindowSeconds?: number }>,
-      step,
+      createTimerStep(),
     );
 
     const revisions = await PostRevisionService.listPostRevisions(
@@ -175,7 +200,7 @@ describe("PostAutoSnapshotWorkflow", () => {
     );
     expect(revisions).toHaveLength(1);
     expect(revisions[0]?.reason).toBe("auto");
-  }, 15000);
+  });
 
   it("waits for the latest edit before creating an auto revision", async () => {
     vi.useFakeTimers();
@@ -192,28 +217,17 @@ describe("PostAutoSnapshotWorkflow", () => {
     });
 
     let sleepCalls = 0;
-    const quietStep: WorkflowStep = {
-      do: step.do,
-      sleep: (async (_name: string, duration: number | string) => {
-        const durationMs =
-          typeof duration === "number"
-            ? duration
-            : ms(toMsDurationLabel(duration));
-        vi.advanceTimersByTime(durationMs);
-        sleepCalls += 1;
-
-        if (sleepCalls === 1) {
-          await updatePost({
-            id,
-            data: {
-              title: "Quiet Window Reset Again",
-            },
-          });
-        }
-      }) as WorkflowStep["sleep"],
-      sleepUntil: step.sleepUntil,
-      waitForEvent: step.waitForEvent,
-    };
+    const quietStep = createTimerStep(async (calls) => {
+      sleepCalls = calls;
+      if (sleepCalls === 1) {
+        await updatePost({
+          id,
+          data: {
+            title: "Quiet Window Reset Again",
+          },
+        });
+      }
+    });
 
     await createWorkflow().run(
       {
@@ -234,6 +248,9 @@ describe("PostAutoSnapshotWorkflow", () => {
   });
 
   it("skips creating a duplicate auto revision when nothing changed", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-14T10:00:00.000Z"));
+
     const { id } = await PostService.createEmptyPost(adminContext);
 
     await updatePost({
@@ -255,7 +272,7 @@ describe("PostAutoSnapshotWorkflow", () => {
       {
         payload: { postId: id, quietWindowSeconds: 5 },
       } as WorkflowEvent<{ postId: number; quietWindowSeconds?: number }>,
-      step,
+      createTimerStep(),
     );
 
     const revisions = await PostRevisionService.listPostRevisions(
